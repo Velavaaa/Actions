@@ -1,0 +1,43 @@
+---
+name: Run Downstream Pipeline
+"on":
+  workflow_call:
+    inputs:
+      pipeline:
+        description: GitHub Actions Workflow YAML file to run
+        required: true
+        type: string
+      repo:
+        description: Downstream repository name
+        required: false
+        default: ${{ github.event.repository.name }}
+        type: string
+      branch:
+        description: Branch name (or tag, or commit SHA)
+        required: false
+        default: ${{ github.event.repository.default_branch || 'main' }}
+        type: string
+      wait:
+        description: Block upstream workflow until complete
+        required: false
+        default: true
+        type: boolean
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run downstream pipeline
+        uses: convictional/trigger-workflow-and-wait@f69fa9eedd3c62a599220f4d5745230e237904be
+        with:
+          owner: ${{ github.repository_owner }}
+          repo: ${{ inputs.repo }}
+          ref: ${{ inputs.branch }}
+          workflow_file_name: ${{ inputs.pipeline }}
+          github_token: ${{ secrets.PLATFORM_CI_GITHUB_WORKFLOW_DISPATCH_TOKEN }}
+          comment_downstream_url: ${{ github.event.pull_request.comments_url }}
+          propagate_failure: ${{ inputs.wait }}
+          wait_workflow: ${{ inputs.wait }}
+          wait_interval: 10
+          trigger_workflow: true
+          client_payload: '{"upstream_sha": "${{ github.sha }}","upstream_repo": "${{ github.event.repository.name }}","upstream_branch": "${{ github.head_ref || github.ref_name }}","upstream_default_branch": "${{ github.event.repository.default_branch }}","upstream_pr": "${{ github.event.pull_request.number }}"}'
+    timeout-minutes: 60
