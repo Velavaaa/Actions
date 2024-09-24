@@ -1,0 +1,18 @@
+---
+name: Export Garden error log
+description: Save Garden error log as an artifact
+inputs:
+  filename-suffix:
+    description: Optional filename suffix
+    required: false
+    type: string
+    default: 0
+runs:
+  using: composite
+  steps:
+    - name: Save Garden error log (if any) as an artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: garden-error-${{ github.job }}-${{ inputs.filename-suffix }}.log
+        path: .garden/error.log
+        retention-days: 30

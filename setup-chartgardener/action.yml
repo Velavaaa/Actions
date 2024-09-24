@@ -1,0 +1,30 @@
+---
+name: Platform CI/CD Chartgardener setup
+description: Install chartgardener and dependencies
+inputs:
+  github-token:
+    required: true
+    type: string
+runs:
+  using: composite
+  steps:
+    - name: Download chartgardener
+      uses: actions/checkout@v4
+      with:
+        repository: uniphore/chartgardener
+        path: chartgardener
+        persist-credentials: false
+        token: ${{ inputs.github-token }}
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.8'
+        cache: pip
+        cache-dependency-path: |
+          **/setup.py
+          **/requirements*.txt
+    - name: Install chartgardener
+      shell: bash
+      run: python -m pip install ./chartgardener
+    - name: Install Helm
+      uses: azure/setup-helm@v4

@@ -1,0 +1,34 @@
+---
+name: Platform CI/CD Cluster teardown
+description: Clean up cluster resources
+inputs:
+  aws-cluster-arn:
+    required: true
+    type: string
+  aws-iam-oidc-role-arn:
+    required: true
+    type: string
+  aws-region:
+    required: true
+    type: string
+runs:
+  using: composite
+  steps:
+    - name: Set up cluster
+      uses: uniphore/platform-github-actions/.github/actions/setup-cluster@main
+      with:
+        aws-cluster-arn: ${{ inputs.aws-cluster-arn }}
+        aws-iam-oidc-role-arn: ${{ inputs.aws-iam-oidc-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+    - name: Clean up cluster namespaces
+      shell: bash
+      run: |
+        mapfile -t namespaces < <(
+          kubectl get namespace --no-headers \
+          | grep -E "(^|[^0-9])${GITHUB_RUN_ID}($|[^0-9])" \
+          | cut -f1 -d' '
+        )
+
+        if [[ "${#namespaces[@]}" -gt 0 ]]; then
+          kubectl delete namespace "${namespaces[@]}"
+        fi

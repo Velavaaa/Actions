@@ -1,0 +1,92 @@
+---
+name: Detect a tech stack in a repository
+description: Scan a repository for the used tech stack
+outputs:
+  chart:
+    description: Helm charts detected
+    value: ${{ steps.chart.outputs.detected }}
+  go:
+    description: Go lang detected by scanning for *.go files
+    value: ${{ steps.go.outputs.detected }}
+  gradle:
+    description: Gradle detected
+    value: ${{ steps.gradle.outputs.detected }}
+  java:
+    description: Java detected by scanning for *.java files
+    value: ${{ steps.java.outputs.detected }}
+  jib:
+    description: JIB detected
+    value: ${{ steps.jib.outputs.detected }}
+  maven:
+    description: Maven detected
+    value: ${{ steps.maven.outputs.detected }}
+  nodejs:
+    description: Node.JS detected
+    value: ${{ steps.nodejs.outputs.detected }}
+  python:
+    description: Python detected by scanning for *.py files
+    value: ${{ steps.python.outputs.detected }}
+runs:
+  using: composite
+  steps:
+    - name: Create scanner
+      shell: bash
+      run: |
+        cat << 'EOF' > "${RUNNER_TEMP}/scanner_${GITHUB_RUN_ID}.sh"
+        tech="${1}"
+        pattern="${2}"
+
+        if [[ -n "$(find . -type f -name "${pattern}" -print -quit)" ]]; then
+          echo "${tech} has been detected (${pattern} files have been found)"
+          echo "detected=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "${tech} has not been detected (no ${pattern} files have been found)"
+        fi
+        EOF
+    - name: Check for Helm charts
+      id: chart
+      shell: bash
+      run: |
+        if [[ -d charts ]]; then
+          echo "Helm charts detected"
+          echo "detected=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "No charts/ directory found. Helm charts have not been detected"
+        fi
+    - name: Check for Go
+      id: go
+      shell: bash
+      run: bash "${RUNNER_TEMP}/scanner_${GITHUB_RUN_ID}.sh" Go '*.go'
+    - name: Check for Gradle
+      id: gradle
+      shell: bash
+      run: bash "${RUNNER_TEMP}/scanner_${GITHUB_RUN_ID}.sh" Gradle 'build*.gradle'
+    - name: Check for Java
+      id: java
+      shell: bash
+      run: bash "${RUNNER_TEMP}/scanner_${GITHUB_RUN_ID}.sh" Java '*.java'
+    - name: Check for JIB
+      if: steps.java.outputs.detected == 'true'
+      id: jib
+      shell: bash
+      run: |
+        shopt -s extglob
+
+        if [[ -n "$(yq '.providers[] | select(.name == "jib") | length' project.garden.y?(a)ml)" ]]; then
+          echo "JIB has been detected"
+          echo "detected=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "JIB has not been detected"
+        fi
+    - name: Check for Maven
+      id: maven
+      shell: bash
+      run: bash "${RUNNER_TEMP}/scanner_${GITHUB_RUN_ID}.sh" Maven 'pom.xml'
+    - name: Check for Node.JS
+      id: nodejs
+      shell: bash
+      run: bash "${RUNNER_TEMP}/scanner_${GITHUB_RUN_ID}.sh" Node.JS 'package.json'
+    - name: Check for Python
+      id: python
+      shell: bash
+      run: bash "${RUNNER_TEMP}/scanner_${GITHUB_RUN_ID}.sh" Python '*.py'

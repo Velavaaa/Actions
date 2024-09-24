@@ -1,0 +1,74 @@
+---
+name: Platform CI/CD DataDog metrics and metadata
+description: Send data to DataDog
+inputs:
+  datadog-token:
+    required: true
+    type: string
+  github-token:
+    required: true
+    type: string
+runs:
+  using: composite
+  steps:
+    - name: Check for the latest release of DataDog CI app
+      id: datadog-ci
+      shell: bash
+      run: |
+        latest_release="$(
+          curl -sS "https://api.github.com/repos/DataDog/datadog-ci/releases/latest" | jq --raw-output '.tag_name'
+        )"
+        echo "The latest release of the DataDog CI app: ${latest_release}"
+        echo "latest_release=${latest_release}" >> "${GITHUB_OUTPUT}"
+    - name: Load DataDog CI app from cache
+      id: datadog-cache
+      uses: actions/cache@v4
+      with:
+        path: /usr/local/bin/datadog-ci
+        key: datadog-ci-${{ steps.datadog-ci.outputs.latest_release }}
+    - name: Download DataDog CI app
+      if: steps.datadog-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        curl -L --fail \
+          "https://github.com/DataDog/datadog-ci/releases/latest/download/datadog-ci_linux-x64" \
+          --output "/usr/local/bin/datadog-ci"
+        chmod +x /usr/local/bin/datadog-ci
+    - name: Send tags and metrics to DataDog
+      shell: bash
+      env:
+        REPO_OWNER: ${{ github.event.repository.owner.name }}
+        REPO_NAME: ${{ github.event.repository.name }}
+        GIT_SHA: ${{ github.sha }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        DATADOG_API_KEY: ${{ inputs.datadog-token }}
+      run: |
+        datadog-ci tag --level pipeline --tags "repo_name:${REPO_NAME}"
+
+        metadata="$(gh pr list --search "${GIT_SHA}" --state merged --json number,author)"
+
+        if [[ "$(jq '.[].author.is_bot' <<< "${metadata}")" == true ]]; then
+          echo "::WARNING::Bot detected as the PR author. Skipping metrics publishing."
+          exit 0
+        fi
+
+        pr="$(jq '.[].number' <<< "${metadata}")"
+        echo "Found PR#: ${pr}"
+
+        commit_date="$(
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${pr}/commits" \
+          | jq --raw-output '.[].commit.author.date' | sort | head -1
+        )"
+
+        commit_timestamp="$(date -d "${commit_date}" +"%s")"
+        current_timestamp="$(date +"%s")"
+        lead_time="$(echo "${current_timestamp} ${commit_timestamp}" | awk '{printf "%f", ($1-$2)/86400}')"
+
+        echo "Commit timestamp: ${commit_timestamp}"
+        echo "Current timestamp: ${current_timestamp}"
+        echo "Lead time for changes (in days): ${lead_time}"
+
+        datadog-ci metric --level pipeline --metrics "lead_time:${lead_time}"

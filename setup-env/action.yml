@@ -1,0 +1,182 @@
+---
+name: Platform CI/CD Environment setup
+description: Setup environment for Platform CI/CD pipelines
+inputs:
+  github-token:
+    type: string
+  github-pkg-token:
+    type: string
+  registry:
+    description: Registry host URL without protocol
+    type: string
+  registry-username:
+    description: Registry username (read or write depending on context)
+    type: string
+  registry-password:
+    description: Registry password (read or write depending on context)
+    type: string
+  chart-login:
+    description: Whether we should 'helm registry login' or not
+    type: string
+runs:
+  using: composite
+  steps:
+    - name: Set up Git
+      uses: uniphore/platform-github-actions/.github/actions/setup-git@main
+      with:
+        github-token: ${{ inputs.github-token }}
+    - name: Scan tech stack
+      uses: uniphore/platform-github-actions/.github/actions/detect-tech-stack@main
+      id: stack
+    - name: Login to Uniphore Registry
+      if: steps.stack.outputs.jib == 'true' && inputs.registry
+      id: registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-password }}
+    - name: Do not login to Uniphore Registry
+      if: steps.registry.outcome == 'skipped'
+      shell: bash
+      run: echo 'Skipping Uniphore Registry login'
+    - name: Login to Uniphore Helm Chart Repository
+      if: inputs.chart-login == 'true' && inputs.registry
+      id: chart
+      uses: uniphore/platform-github-actions/.github/actions/login-helm@main
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-password }}
+    - name: Do not login to Uniphore Helm Chart Registry
+      if: steps.chart.outcome == 'skipped'
+      shell: bash
+      run: echo 'Skipping Uniphore Helm Chart Repository login'
+    - name: Set up Git credentials for private Go vendors
+      if: steps.stack.outputs.go == 'true'
+      shell: bash
+      env:
+        GITHUB_PULL_TOKEN: ${{ inputs.github-token || github.token }}
+        REPO_OWNER: ${{ github.repository_owner }}
+      run: |
+        if grep -m1 -E "^(require\s)?\s*github.com/${REPO_OWNER}" go.mod; then
+          echo "Setting Git credentials for private Go vendors: ${REPO_OWNER}"
+          echo "machine github.com login ${GITHUB_PULL_TOKEN}" >> "${HOME}/.netrc"
+        fi
+    - name: Upgrade default GitHub Python 3.10 to latest
+      if: steps.stack.outputs.python == 'true'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Set up Git credentials for private Python vendors
+      if: steps.stack.outputs.python == 'true'
+      shell: bash
+      env:
+        GITHUB_PULL_TOKEN: ${{ inputs.github-token || github.token }}
+        REPO_OWNER: ${{ github.repository_owner }}
+      run: |
+        find . -type f -name 'requirements*.txt' -print0 | while IFS= read -r -d $'\0' file; do
+          if grep -m1 "uniphore.*\.zip$" "${file}" || grep -m1 "@ git+https://github\.com/${REPO_OWNER}/.*\.git@.*" "${file}"; then
+            echo "Setting Git credentials for private Python vendors: ${REPO_OWNER}"
+            echo "machine github.com login ${GITHUB_PULL_TOKEN}" >> "${HOME}/.netrc"
+            break
+          fi
+        done
+    - name: Inject Node.js credentials
+      if: steps.stack.outputs.nodejs == 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-pkg-token || github.token }}
+      run: echo "//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}" >> "${HOME}/.npmrc"
+    - name: Scan for Java build tools
+      if: steps.stack.outputs.jib == 'true'
+      id: java
+      shell: bash
+      env:
+        GRADLE: ${{ steps.stack.outputs.gradle }}
+        MAVEN: ${{ steps.stack.outputs.maven }}
+      run: |
+        declare -xr DEFAULT_GARDEN_JDK_VERSION=11
+
+        if [[ "${GRADLE}" == true ]]; then
+          declare -xr DEFAULT_BUILD_TOOL='gradle'
+        elif [[ "${MAVEN}" == true ]]; then
+          declare -xr DEFAULT_BUILD_TOOL='maven'
+        else
+          echo "::ERROR::Java build tool does not match Gradle or Maven"
+          exit 1
+        fi
+
+        BUILD_CONFIG="$(
+          find . -regex '.*[^a-zA-Z_-]garden\.ya?ml$' -not -path './.garden/*' -exec \
+            yq eval-all '
+              select(.kind == "Module" and .type == "jib-container")
+              | .build
+              | {
+                  "jdkVersion": .jdkVersion // env(DEFAULT_GARDEN_JDK_VERSION),
+                  "projectType": .projectType // env(DEFAULT_BUILD_TOOL)
+                }
+            ' {} \+
+        )"
+
+        jdk_version="$(yq --no-doc '.jdkVersion' <<< "${BUILD_CONFIG}" | sort --unique)"
+        if [[ "$(wc -l <<< "${jdk_version}")" > 1 ]]; then
+          echo "::ERROR::Multiple JDK versions found"
+          exit 1
+        fi
+        echo "jdk-version=${jdk_version}" >> "${GITHUB_OUTPUT}"
+
+        build_tool="$(yq --no-doc '.projectType' <<< "${BUILD_CONFIG}" | sort --unique)"
+        if [[ "$(wc -l <<< "${build_tool}")" > 1 ]]; then
+          echo "::ERROR::Multiple Java build tools found"
+          exit 1
+        fi
+        [[ "${build_tool}" == 'auto' ]] && build_tool="${DEFAULT_BUILD_TOOL}"
+        echo "build-tool=${build_tool}" >> "${GITHUB_OUTPUT}"
+    - name: Set up JIB
+      if: steps.stack.outputs.jib == 'true'
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ steps.java.outputs.jdk-version }}
+        cache: ${{ steps.java.outputs.build-tool }}
+    - name: Scan for Uniphore Maven repositories
+      if: >
+        steps.stack.outputs.jib == 'true'
+        && steps.java.outputs.build-tool == 'maven'
+      id: maven
+      shell: bash
+      run: |
+        {
+          echo "repositories<<EOF"
+          find . -type f -name pom.xml -exec grep --only-matching --perl-regexp \
+            '<url>\Khttps:\/\/maven.pkg.github.com\/uniphore\/.*?(?=<\/url>)' {} \; \
+          | sort --unique \
+          | jq --raw-input --null-input '
+            [ inputs |
+              {
+                "id": "uniphore-github",
+                url: .,
+                "snapshots": {
+                  "enabled": "true"
+                }
+              }
+            ] | . + [{"id": "central", "url": "https://repo1.maven.org/maven2"}]'
+          echo "EOF"
+        } >> "${GITHUB_OUTPUT}"
+    - name: Inject Maven credentials
+      if: >
+        steps.stack.outputs.java == 'true'
+        && steps.maven.outputs.repositories != '[]'
+      uses: whelk-io/maven-settings-xml-action@9dc09b23833fa9aa7f27b63db287951856f3433d
+      env:
+        GITHUB_USER: platform-ci
+        GITHUB_TOKEN: ${{ inputs.github-pkg-token || github.token }}
+      with:
+        repositories: ${{ steps.maven.outputs.repositories }}
+        servers: |
+          [{
+            "id": "uniphore-github",
+            "username": "${{ env.GITHUB_USER }}",
+            "password": "${{ env.GITHUB_TOKEN }}"
+          }]

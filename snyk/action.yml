@@ -1,0 +1,61 @@
+---
+name: Platform CI/CD Snyk Integration
+description: Manage Snyk integration with Platform CI/CD
+inputs:
+  command:
+    required: true
+    type: string
+  fail-on-vulns:
+    required: false
+    default: false
+    type: boolean
+  monitor:
+    required: false
+    type: string
+  report-name:
+    required: true
+    type: string
+  token:
+    required: true
+    type: string
+runs:
+  using: composite
+  steps:
+    - name: Set up Snyk
+      uses: snyk/actions/setup@master
+    - name: Run Snyk command
+      id: scan
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        REPORT_NAME: ${{ inputs.report-name }}
+        SNYK_TOKEN: ${{ inputs.token }}
+      run: snyk "${COMMAND}" "--json-file-output=security-${REPORT_NAME}-report.json"
+      continue-on-error: true
+    - name: Monitor snapshot in Snyk platform
+      if: >
+        github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        && inputs.monitor
+      shell: bash
+      env:
+        MONITOR: ${{ inputs.monitor }}
+        SNYK_TOKEN: ${{ inputs.token }}
+      run: snyk "${MONITOR}"
+    - name: Save Snyk report
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-${{ inputs.report-name }}-report.json
+        path: security-${{ inputs.report-name }}-report.json
+        if-no-files-found: ignore
+    - name: Fail (or warn) if vulnerabilities found
+      if: steps.scan.outcome == 'failure'
+      shell: bash
+      env:
+        FAIL_ENABLED: ${{ inputs.fail-on-vulns}}
+      run: |
+        echo "::WARNING::Security vulnerabilities have been detected" \
+              "(see the job report artifact or step in the job for more details)"
+
+        if [[ "${FAIL_ENABLED}" == true ]]; then
+          exit 1
+        fi

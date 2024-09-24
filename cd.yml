@@ -1,0 +1,196 @@
+---
+name: Platform CD Workflow
+"on":
+  workflow_call:
+    inputs:
+      images-map:
+        required: false
+        type: string
+        description: A map of the built images
+defaults:
+  run:
+    shell: bash
+jobs:
+  build-charts:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.build.outputs.name }}
+      version: ${{ steps.build.outputs.version }}
+    steps:
+      - name: Set up Git
+        uses: uniphore/platform-github-actions/.github/actions/setup-git@main
+      - name: Install chartgardener
+        uses: uniphore/platform-github-actions/.github/actions/setup-chartgardener@main
+        with:
+          github-token: ${{ secrets.PLATFORM_CI_GITHUB_PULL_TOKEN }}
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          token: ${{ secrets.platform_ci_github_push_token }}
+      - name: Scan for tech stack
+        uses: uniphore/platform-github-actions/.github/actions/detect-tech-stack@main
+        id: stack
+      - name: Build charts
+        if: steps.stack.outputs.chart == 'true'
+        id: build
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          # Chart repository credentials required for chartgardener authentication
+          OCI_REGISTRY_HOST: ${{ vars.platform_oci_registry_host }}
+          OCI_REGISTRY_USER: ${{ vars.platform_oci_registry_user }}
+          OCI_REGISTRY_PASSWORD: ${{ secrets.platform_oci_registry_password }}
+        run: |
+          version_hash="v$(cut -c1-8 <<< "${GITHUB_SHA}")"
+
+          chartgardener --action=push-charts --chart-version-hash="${version_hash}" --log-level=INFO
+
+          charts="$(git diff --name-only)"
+          echo "Pushed charts: ${charts}"
+
+          if [[ "$(grep -c '' <<< "${charts}")" != 1 ]]; then
+            echo "::ERROR::Unsupported number of charts. Building only a single chart per service is allowed."
+            exit 1
+          fi
+
+          name="$(yq .name "${charts}")"
+          version="$(yq .version "${charts}")"
+          echo "Chart name: ${name}"
+          echo "Chart version: ${version}"
+          [[ -n "${name}" && -n "${version}" ]]
+
+          git diff
+          git add -A
+          git diff-index --quiet HEAD || git commit -m "[github-ci] Build ${name} chart with version ${version}"
+          git push
+
+          echo "name=${name}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+      - name: Debug mode
+        if: failure() || runner.debug && always()
+        uses: uniphore/platform-github-actions/.github/actions/debug@main
+    timeout-minutes: 60
+  deploy:
+    needs: build-charts
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Set up Git
+        uses: uniphore/platform-github-actions/.github/actions/setup-git@main
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: true
+          token: ${{ secrets.platform_ci_github_push_token }}
+      - name: Sign container image(s)
+        if: inputs.images-map != '{}'
+        uses: uniphore/platform-github-actions/.github/actions/sign-container-images@main
+        with:
+          images-map: ${{ inputs.images-map }}
+          registry: ${{ vars.platform_registry_host_url }}
+          registry-username: ${{ vars.platform_registry_user }}
+          registry-password: ${{ secrets.platform_registry_pwd }}
+      - name: Check deployment conditions
+        id: prerequisites
+        run: |
+          if [[ -d deploy ]]; then
+            echo "deploy=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "deploy/ directory for Flux configuration not found"
+            echo "deploy=false" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Deploy via Flux
+        if: steps.prerequisites.outputs.deploy == 'true'
+        id: deploy
+        env:
+          APP_NAME: ${{ needs.build-charts.outputs.name }}
+          APP_VERSION: ${{ needs.build-charts.outputs.version }}
+          IMAGES: ${{ inputs.images-map }}
+          SLACK_WEBHOOK: ${{ secrets.platform_ci_slack_webhook }}
+        run: |
+          shopt -s extglob
+          shopt -s nullglob
+
+          readonly APP_RELEASE_PATH="deploy/base/release.y?(a)ml"
+
+          function log_image {
+              commit_message+=" image=$1"
+              slack_message+=" image=$1"
+              github_message+=" image=$1"
+          }
+
+          function exists { [[ -f $1 ]]; }
+
+
+          # shellcheck disable=SC2086
+          if ! exists ${APP_RELEASE_PATH}; then
+            echo "::ERROR::Missing Kustomize base overlay: ${APP_RELEASE_PATH} not found"
+            exit 1
+          fi
+
+          # shellcheck disable=SC2086
+          release_name="$(yq '.spec.releaseName' ${APP_RELEASE_PATH})"
+          if [[ "${release_name}" != "${APP_NAME}" ]]; then
+            echo "::ERROR::Chart name ${APP_NAME} does not much release name ${release_name}"
+            exit 1
+          fi
+
+
+          # shellcheck disable=SC2086
+          yq -i '.spec.chart.spec.version=env(APP_VERSION)' ${APP_RELEASE_PATH}
+
+          commit_message="[github-ci] ${APP_NAME} incremented to chart=${APP_VERSION}"
+          slack_message="${APP_NAME} deployed chart=${APP_VERSION}"
+          github_message=":rocket: ${APP_NAME} has been sucessfully deployed! chart=${APP_VERSION}"
+
+
+          if [[ "$(jq 'keys | length' <<< "${IMAGES}")" == 1 ]]; then
+            BUILD_IMAGE_ID="$(jq --raw-output '.[keys[0]]' <<< "${IMAGES}")"
+            export BUILD_IMAGE_ID
+
+            if [[ -n "${BUILD_IMAGE_ID}" ]]; then
+              # shellcheck disable=SC2086
+              yq -i '.spec.values.image.id=env(BUILD_IMAGE_ID)' ${APP_RELEASE_PATH}
+              log_image "${BUILD_IMAGE_ID}"
+            fi
+          else
+            while read -r IMAGE_NAME; do
+              BUILD_IMAGE_ID="$(
+                jq --arg image "$IMAGE_NAME" --raw-output '.[$image]' <<< "${IMAGES}"
+              )"
+              export IMAGE_NAME BUILD_IMAGE_ID
+
+              if [[ -n "${BUILD_IMAGE_ID}" ]]; then
+                # shellcheck disable=SC2086
+                yq -i '.spec.values.[env(IMAGE_NAME)].image.id=env(BUILD_IMAGE_ID)' ${APP_RELEASE_PATH}
+                log_image "${BUILD_IMAGE_ID}"
+              fi
+            done < <(jq --raw-output 'keys | .[]' <<< "${IMAGES}")
+          fi
+
+
+          git diff
+          git add -A
+          git diff-index --quiet HEAD || git commit -m "${commit_message}"
+          git push
+
+          echo "slack_message=${slack_message}" >> "${GITHUB_OUTPUT}"
+          echo "${github_message}" >> "${GITHUB_STEP_SUMMARY}"
+      - name: Send notification to Slack
+        uses: rtCamp/action-slack-notify@4e5fb42d249be6a45a298f3c9543b111b02f7907
+        env:
+          SLACK_WEBHOOK: ${{ secrets.PLATFORM_CI_SLACK_WEBHOOK }}
+          SLACK_MESSAGE: ${{ steps.deploy.outputs.slack_message }}
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_TITLE: Deployed
+      - name: Send metrics to DataDog
+        uses: uniphore/platform-github-actions/.github/actions/datadog@main
+        with:
+          datadog-token: ${{ secrets.PLATFORM_CI_DATADOG_API_KEY }}
+          github-token: ${{ secrets.PLATFORM_CI_GITHUB_PULL_TOKEN }}
+      - name: Debug mode
+        if: failure() || runner.debug && always()
+        uses: uniphore/platform-github-actions/.github/actions/debug@main
+    timeout-minutes: 60

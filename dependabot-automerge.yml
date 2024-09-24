@@ -1,0 +1,37 @@
+---
+name: Platform Dependabot Automerge Workflow
+"on":
+  workflow_call:
+defaults:
+  run:
+    shell: bash
+jobs:
+  dependabot-automerge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v1
+        with:
+          github-token: ${{ secrets.PLATFORM_CI_GITHUB_PUSH_TOKEN  }}
+          alert-lookup: true
+          compat-lookup: true
+      - name: Enable auto-merge for Dependabot PRs
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GITHUB_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.PLATFORM_CI_GITHUB_PUSH_TOKEN  }}
+        run: |
+          gh pr review --approve "${PR_URL}"
+
+          squash_allowed="$(gh repo view --json squashMergeAllowed -q '.squashMergeAllowed')"
+          if [[ "${squash_allowed}" == true ]]; then
+            gh pr merge --squash "${PR_URL}"
+          else
+            gh pr merge --merge "${PR_URL}"
+          fi

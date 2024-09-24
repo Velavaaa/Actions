@@ -1,0 +1,31 @@
+---
+name: Workflow validation
+description: Validate the workflow conclusion
+runs:
+  using: composite
+  steps:
+    - name: Validate workflow conclusion
+      shell: bash
+      env:
+        REPO_NAME: ${{ github.event.repository.name }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        echo "::group::jobs conclusion"
+        jobs_list="$(curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+          "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs")"
+        echo "${jobs_list}"
+        job_conclusions="$(jq -r '.jobs[].conclusion' <<< "${jobs_list}")"
+        echo "::endgroup::"
+
+        if grep -q '\bfailure\b' <<< "${job_conclusions[@]}"; then
+          overall_status="failure"
+        else
+          overall_status="success"
+        fi
+
+        if [[ "${overall_status}" == 'failure' ]]; then
+          echo "::ERROR::Workflow has one or more failed jobs"
+          exit 1
+        fi
+
+        echo "All CI pipeline jobs completed successfully"

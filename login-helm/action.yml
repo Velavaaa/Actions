@@ -1,0 +1,48 @@
+---
+name: OCI Helm Chart Registry login
+description: Login to OCI Helm Chart Registry
+inputs:
+  registry:
+    required: true
+    type: string
+    description: OCI Chart Registry host URL without protocol
+  username:
+    required: true
+    type: string
+    description: OCI Chart Registry username
+  password:
+    required: true
+    type: string
+    description: OCI Chart Registry password
+runs:
+  using: composite
+  steps:
+    - name: Scan for uniphore-charts repository
+      id: scan-charts
+      shell: bash
+      env:
+        REGISTRY_HOST: ${{ inputs.registry }}
+      run: |
+        shopt -s extglob
+
+        grep -R "oci://${REGISTRY_HOST}/uniphore-charts/" && found=true
+
+        yq -e \
+          '.sources[].repositoryUrl | contains("platform-thirdparty-modules")' \
+          project.garden.y?(a)ml 2>/dev/null && found=true
+
+        if [[ "${found}" != true ]]; then
+          echo 'No uniphore-charts references were found in the repository'
+        fi
+        echo "repo=${found}" >> "${GITHUB_OUTPUT}"
+    - name: Add uniphore-charts Helm Chart Repository
+      if: steps.scan-charts.outputs.repo == 'true'
+      shell: bash
+      env:
+        REGISTRY_HOST: ${{ inputs.registry }}
+        REGISTRY_USERNAME: ${{ inputs.username }}
+        REGISTRY_PASSWORD: ${{ inputs.password }}
+      run: |
+        echo "${REGISTRY_PASSWORD}" | helm registry login "${REGISTRY_HOST}" \
+          --username="${REGISTRY_USERNAME}" \
+          --password-stdin
